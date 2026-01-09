@@ -4,12 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/tidwall/gjson"
-	"golang.org/x/sys/windows/registry"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/tidwall/gjson"
+	"golang.org/x/sys/windows/registry"
 )
 
 const (
@@ -31,7 +32,8 @@ const (
 
 const (
 	// using the VBScript to open IDE as admin
-	_VBScript  = `mshta vbscript:createobject("shell.application").shellexecute("%s","%%V","","runas",1)(close)`
+	//_VBScript  = `mshta vbscript:createobject("shell.application").shellexecute("%s","%%V","","runas",1)(close)`
+	_VBScript  = `powershell -NoProfile -Command "Start-Process '%s' -ArgumentList '%%V' -Verb RunAs"`
 	_CmdScript = `"%s" "%%V"`
 )
 
@@ -287,7 +289,7 @@ func SetMenu(dir string, items []string, top bool) error {
 func SetMenuItem(path, display, command, subCommands string, top bool) error {
 	key, err := OpenOrCreateKey(registry.CLASSES_ROOT, path, registry.WRITE)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open/create registry key[%s]: %w", path, err)
 	}
 	defer key.Close()
 
@@ -317,16 +319,45 @@ func SetMenuItem(path, display, command, subCommands string, top bool) error {
 	return nil
 }
 
+// getValidIconPath automatically handles absolute/relative paths to avoid duplicate drive letters
+func getValidIconPath(tool *Tool) string {
+	// If Command is an absolute path, use it directly; otherwise, join it with Location
+	if filepath.IsAbs(tool.Command) {
+		return tool.Command
+	}
+	return filepath.Join(tool.Location, tool.Command)
+}
+
+// validateIconPath validates the legitimacy of the icon path
+func validateIconPath(ico string) error {
+	// check for duplicate drive letters (e.g., D:\a\D:\b.exe)
+	if strings.Count(ico, ":") > 1 {
+		return fmt.Errorf("icon path contains duplicate drive letters: %s", ico)
+	}
+	// check if file exists
+	if _, err := os.Stat(ico); err != nil {
+		return fmt.Errorf("icon file does not exist or access denied: %s, error: %w", ico, err)
+	}
+	return nil
+}
+
 // SetItem setItem add items to commandStore shell
 func SetItem(tool *Tool, admin bool) error {
 
 	regPath := CommandStoreShell + tool.Id
-	ico := filepath.Join(tool.Location, tool.Command)
-	script := tool.Script
+	ico := getValidIconPath(tool)
+
 	// special case for MPS
 	if tool.Id == "MPS" {
 		ico = filepath.Join(tool.Location, "bin/mps.ico")
 	}
+
+	// icon path validation
+	if err := validateIconPath(ico); err != nil {
+		return fmt.Errorf("failed to validate icon path for tool [%s]: %w", tool.Name, err)
+	}
+
+	script := tool.Script
 	if tool.Availability == legacy {
 		script = ico
 	} else if tool.Availability == unavailable {
@@ -335,27 +366,29 @@ func SetItem(tool *Tool, admin bool) error {
 	// create or open registry key
 	key, err := OpenOrCreateKey(registry.LOCAL_MACHINE, regPath, registry.WRITE)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open/create registry key [%s]: %w", regPath, err)
 	}
+	defer key.Close()
 
 	// default value
 	if err := key.SetStringValue("", fmt.Sprintf("Open %s Here", tool.Name)); err != nil {
-		return err
+		return fmt.Errorf("failed to set registry default value: %w", err)
 	}
 	// set icon
 	if err := key.SetStringValue("Icon", ico); err != nil {
-		return err
+		return fmt.Errorf("failed to set icon registry value: %w", err)
 	}
 
 	// command sub key
 	cmdKey, err := OpenOrCreateKey(registry.LOCAL_MACHINE, regPath+`\command`, registry.WRITE)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open/create command subkey [%s]: %w", regPath+`\command`, err)
 	}
+	defer cmdKey.Close()
 
 	// set command
 	if err := cmdKey.SetStringValue("", commandScript(script, admin)); err != nil {
-		return err
+		return fmt.Errorf("failed to set command subkey value: %w", err)
 	}
 
 	return nil
